@@ -1,236 +1,396 @@
-import telebot
-import time
-import random
+"""
+FB Friend Checker Telegram Bot — v8 (Final: CSV + Hardened + Network Resilient)
+============================================================================
+Architecture: Persistent Global Headless Browser
+Target Site:  mbasic.facebook.com
+"""
+
 import os
 import re
-import shutil # <--- Corrupted Profile ডিলিট করার জন্য যুক্ত করা হয়েছে
-from io import BytesIO
+import time
+import telebot
+from telebot import apihelper
+from telebot import types
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.keys import Keys
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import (
+    TimeoutException,
+    NoSuchElementException,
+    WebDriverException,
+)
 from webdriver_manager.chrome import ChromeDriverManager
 
-# 1. এখানে আপনার Telegram Bot Token দিন
-BOT_TOKEN = "8704185513:AAFf1Yft0Gx_Pk8fEa5YYTSBLQyrVYh203k"
+# ============================================================
+# 🔐 CONFIG
+# ============================================================
+BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # <-- Put your token here
+MAX_UIDS_PER_BATCH = 50
+PAGE_LOAD_DELAY = 2          # seconds between UID checks
+WAIT_TIMEOUT = 8             # explicit-wait timeout
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
-user_states = {}
-user_credentials = {}
+# Tell the bot to survive network drops and VPN disconnects
+apihelper.RETRY_ON_ERROR = True
 
-# --- Selenium Setup Function ---
-def setup_driver(chat_id):
-    chrome_options = Options()
-    chrome_options.add_argument("--headless=new") 
-    chrome_options.add_argument("--disable-notifications")
-    chrome_options.add_argument("--window-size=1920,1080")
-    
-    # লিনাক্স সার্ভারের জন্য অতি গুরুত্বপূর্ণ ফ্ল্যাগ
-    chrome_options.add_argument("--no-sandbox") 
-    chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-gpu") 
-    
-    # Facebook Anti-Bot Bypass (যাতে ফেসবুক বুঝতে না পারে এটা বট)
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    
-    # ভার্চুয়াল প্রোফাইল সেভ করার লোকেশন
-    profile_path = os.path.join(os.getcwd(), f"chrome_profile_{chat_id}")
-    chrome_options.add_argument(f"--user-data-dir={profile_path}")
-    
-    chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-    
-    chrome_options.page_load_strategy = 'eager' 
-    
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-    return driver
+# ============================================================
+# 🌐 GLOBAL STATE
+# ============================================================
+global_driver = None
+user_credentials = {}        # {chat_id: {'email': ..., 'password': ...}}
 
-# --- Bot Handlers ---
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    text = (
-        "Welcome to FB Friend Checker Bot! 🤖\n\n"
-        "Options:\n"
-        "/login - Login to your fake FB account\n"
-        "/check - Send UIDs as text to check (Max 50)\n"
-        "/reset - Delete corrupted profile if you face any error\n"
-    )
-    bot.reply_to(message, text)
+# ============================================================
+# 🚀 DRIVER FACTORY (Persistent Browser)
+# ============================================================
+def get_driver():
+    global global_driver
 
-# --- 3. Reset Corrupted Profile (NEW) ---
-@bot.message_handler(commands=['reset'])
-def reset_profile(message):
-    chat_id = message.chat.id
-    profile_path = os.path.join(os.getcwd(), f"chrome_profile_{chat_id}")
-    
-    bot.send_message(chat_id, "⚙️ Deleting corrupted profile... please wait.")
-    
-    if os.path.exists(profile_path):
+    if global_driver is not None:
         try:
-            shutil.rmtree(profile_path)
-            bot.send_message(chat_id, "✅ Your Chrome profile has been successfully deleted! \n\nPlease use /login to create a fresh session.")
-        except Exception as e:
-            bot.send_message(chat_id, f"❌ Failed to delete profile. A background Chrome process might be locking it.\nError: {e}")
-    else:
-        bot.send_message(chat_id, "⚠️ No saved profile found to delete.")
+            _ = global_driver.current_url
+            return global_driver
+        except WebDriverException:
+            print("[driver] Dead browser detected, reinitializing...")
+            global_driver = None
 
-# --- 1. Login Process (Smart Login) ---
-@bot.message_handler(commands=['login'])
-def login_start(message):
+    chrome_options = Options()
+    chrome_options.add_argument("--headless=new")
+    chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--window-size=1366,768")
+    
+    # Force English locale to bypass regional language issues on mbasic
+    chrome_options.add_argument("--lang=en-US") 
+    
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_experimental_option("useAutomationExtension", False)
+
+    # Updated User-Agent to Chrome 126 to prevent "Unsupported Browser" blocks
+    chrome_options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    )
+
+    service = Service(ChromeDriverManager().install())
+    global_driver = webdriver.Chrome(service=service, options=chrome_options)
+
+    global_driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {"source": "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"},
+    )
+    print("[driver] New persistent browser launched.")
+    return global_driver
+
+
+# ============================================================
+# 🧰 HELPERS
+# ============================================================
+def is_session_alive(driver) -> bool:
+    try:
+        cookies = {c["name"] for c in driver.get_cookies()}
+        return "c_user" in cookies
+    except Exception:
+        return False
+
+def dismiss_interstitials(driver):
+    interstitial_selectors = [
+        "//a[contains(@href,'save-device') and (contains(translate(.,'NOT','not'),'not now') or contains(translate(.,'SKIP','skip'),'skip'))]",
+        "//input[@value='Not Now' or @value='Not now']",
+        "//button[contains(translate(.,'ACEPT','acept'),'accept')]",
+        "//a[contains(translate(.,'SKIP','skip'),'skip')]",
+    ]
+    for xp in interstitial_selectors:
+        try:
+            el = driver.find_element(By.XPATH, xp)
+            el.click()
+            time.sleep(1.5)
+        except Exception:
+            continue
+
+def send_debug_screenshot(chat_id, caption: str):
+    global global_driver
+    fname = f"debug_{chat_id}_{int(time.time())}.png"
+    try:
+        global_driver.save_screenshot(fname)
+        with open(fname, "rb") as photo:
+            bot.send_photo(chat_id, photo, caption=caption, parse_mode="Markdown")
+    except Exception as e:
+        pass
+    finally:
+        try:
+            if os.path.exists(fname):
+                os.remove(fname)
+        except OSError:
+            pass
+
+def parse_uids(text: str):
+    raw = re.split(r"[\s,;]+", text.strip())
+    return [u for u in raw if u.isdigit()]
+
+def extract_friend_count(driver):
+    """Scans the profile for the friend count and extracts ONLY the number."""
+    try:
+        links = driver.find_elements(By.TAG_NAME, "a")
+        for link in links:
+            txt = (link.text or "").strip().lower()
+            if not txt:
+                continue
+            
+            # 1. Skip action buttons that don't represent the count
+            skip_words = ['add', 'ajouter', 'trouver', 'find', 'agregar', 'buscar', 'see all', 'voir', 'ver']
+            if any(skip in txt for skip in skip_words):
+                continue
+            
+            # 2. Look for language-specific friend keywords
+            target_words = ['friend', 'ami', 'amigo', 'বন্ধু']
+            if any(target in txt for target in target_words):
+                # 3. Clean string (remove commas/dots like 1,000) and extract digits
+                clean_txt = txt.replace(',', '').replace('.', '')
+                nums = re.findall(r'\d+', clean_txt)
+                if nums:
+                    return nums[0] # Return just the number string
+    except Exception:
+        pass
+    
+    return None # Return None if hidden or no number found
+
+# ============================================================
+# 🤖 COMMAND HANDLERS
+# ============================================================
+@bot.message_handler(commands=["start"])
+def cmd_start(message):
+    bot.send_message(
+        message.chat.id,
+        "👋 *FB Friend Checker Bot v8*\n\n"
+        "📌 *Commands:*\n"
+        "• /login — Sign in with your dummy FB account\n"
+        "• /check — Paste UIDs (max 50) to check\n"
+        "• /status — Verify session is alive\n"
+        "• /reset — Kill browser & restart fresh\n",
+        parse_mode="Markdown",
+    )
+
+@bot.message_handler(commands=["status"])
+def cmd_status(message):
+    global global_driver
+    if global_driver is None:
+        bot.send_message(message.chat.id, "🔴 No browser running. Use /login.")
+        return
+    try:
+        url = global_driver.current_url
+        alive = is_session_alive(global_driver)
+        status = "🟢 LOGGED IN" if alive else "🟡 BROWSER ALIVE BUT NOT LOGGED IN"
+        bot.send_message(message.chat.id, f"{status}\n📍 URL: `{url}`", parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(message.chat.id, f"🔴 Browser dead: `{e}`", parse_mode="Markdown")
+
+@bot.message_handler(commands=["reset"])
+def cmd_reset(message):
+    global global_driver
+    if global_driver:
+        try:
+            global_driver.quit()
+        except Exception:
+            pass
+        global_driver = None
+    bot.send_message(message.chat.id, "♻️ Browser killed. Use /login to start fresh.")
+
+# ------------------------------------------------------------
+# /login — multi-step conversation
+# ------------------------------------------------------------
+@bot.message_handler(commands=["login"])
+def cmd_login(message):
     chat_id = message.chat.id
-    user_states[chat_id] = 'waiting_for_email'
-    bot.send_message(chat_id, "Please send your Fake FB Email/Number:")
+    if global_driver is not None and is_session_alive(global_driver):
+        bot.send_message(chat_id, "✅ Already logged in. Use /check anytime.")
+        return
+    msg = bot.send_message(chat_id, "📧 Send the dummy FB *email* or phone:", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, get_email)
 
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id) == 'waiting_for_email')
 def get_email(message):
     chat_id = message.chat.id
-    user_credentials[chat_id] = {'email': message.text}
-    user_states[chat_id] = 'waiting_for_password'
-    bot.send_message(chat_id, "Now send the Password:")
+    user_credentials[chat_id] = {"email": message.text.strip()}
+    msg = bot.send_message(chat_id, "🔑 Now send the *password*:", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, get_password)
 
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id) == 'waiting_for_password')
 def get_password(message):
     chat_id = message.chat.id
-    user_credentials[chat_id]['password'] = message.text
-    user_states[chat_id] = 'normal' 
-    
-    bot.send_message(chat_id, "Checking login status... Please wait ⏳")
-    
-    driver = None
+    user_credentials[chat_id]["password"] = message.text.strip()
     try:
-        driver = setup_driver(chat_id)
-        driver.get("https://www.facebook.com/") 
-        
+        bot.delete_message(chat_id, message.message_id)
+    except Exception:
+        pass
+
+    status = bot.send_message(chat_id, "🔄 Launching browser & logging in...")
+
+    try:
+        driver = get_driver()
+        driver.get("https://mbasic.facebook.com/")
+
         try:
-            wait = WebDriverWait(driver, 5) 
+            wait = WebDriverWait(driver, WAIT_TIMEOUT)
             email_field = wait.until(EC.presence_of_element_located((By.NAME, "email")))
-            
-            email_field.send_keys(user_credentials[chat_id]['email'])
+            email_field.send_keys(user_credentials[chat_id]["email"])
             pass_field = driver.find_element(By.NAME, "pass")
-            pass_field.send_keys(user_credentials[chat_id]['password'])
+            pass_field.send_keys(user_credentials[chat_id]["password"])
             pass_field.send_keys(Keys.RETURN)
-            
-            # Login হওয়ার পর Session/Cookies হার্ডডিস্কে সেভ হওয়ার জন্য পর্যাপ্ত সময় দেওয়া হলো
-            time.sleep(8) 
-            
-            bot.send_message(chat_id, "✅ Login Successful & Profile Saved! Ebar apni /check command diye UID send korte paren.")
-            
+
+            time.sleep(5)
+            dismiss_interstitials(driver)
+            driver.get("https://mbasic.facebook.com/")
+            time.sleep(2)
+            dismiss_interstitials(driver)
+
+            if is_session_alive(driver):
+                bot.edit_message_text(
+                    "✅ *Login Successful!*\n🟢 Session verified via `c_user` cookie.\n🚀 Browser running in background. Use /check anytime.",
+                    chat_id, status.message_id, parse_mode="Markdown"
+                )
+            else:
+                current_url = driver.current_url
+                bot.edit_message_text(f"❌ *Login Failed.*\n📍 Stuck at: `{current_url}`\n📸 Sending screenshot...", chat_id, status.message_id, parse_mode="Markdown")
+                send_debug_screenshot(chat_id, "🔍 *Login failure capture.*")
+
         except TimeoutException:
-            bot.send_message(chat_id, "✅ You are ALREADY logged in! Session found. Ebar apni /check command diye UID send korte paren.")
-            
+            if is_session_alive(driver):
+                bot.edit_message_text("✅ *Already Logged In!*\n🚀 Use /check anytime.", chat_id, status.message_id, parse_mode="Markdown")
+            else:
+                bot.edit_message_text("⚠️ Email field not found AND no active session.", chat_id, status.message_id)
+
     except Exception as e:
-        error_msg = f"❌ Login Process Failed!\nError: {e}"
-        bot.send_message(chat_id, error_msg)
-    finally:
-        if driver: 
-            driver.quit() 
+        bot.edit_message_text(f"❌ *Login process crashed.*\nError: `{e}`", chat_id, status.message_id, parse_mode="Markdown")
 
-# --- 2. Check UIDs from Text Message (With LIVE Progress) ---
-@bot.message_handler(commands=['check'])
-def check_start(message):
-    chat_id = message.chat.id
-    user_states[chat_id] = 'waiting_for_uids'
-    bot.send_message(chat_id, "📝 Please send your UIDs here.\n(You can paste them line by line, or separated by spaces/commas. Max 50):")
 
-@bot.message_handler(func=lambda message: user_states.get(message.chat.id) == 'waiting_for_uids')
-def process_uids_text(message):
+# ------------------------------------------------------------
+# /check — UID batch processing with live progress
+# ------------------------------------------------------------
+@bot.message_handler(commands=["check"])
+def cmd_check(message):
     chat_id = message.chat.id
-    user_states[chat_id] = 'normal' 
-    
-    profile_path = os.path.join(os.getcwd(), f"chrome_profile_{chat_id}")
-    
-    if not os.path.exists(profile_path):
-        bot.reply_to(message, "⚠️ Age /login kore apna fake ID set korun.")
+    if global_driver is None or not is_session_alive(global_driver):
+        bot.send_message(chat_id, "🔴 Not logged in. Run /login first.")
         return
 
-    driver = None
-    try:
-        raw_text = message.text
-        uids = [uid.strip() for uid in re.split(r'[\n\r\s,]+', raw_text) if uid.strip()]
-        
-        if not uids:
-            bot.reply_to(message, "⚠️ No valid UIDs found in your message. Please try /check again.")
-            return
+    msg = bot.send_message(chat_id, f"📋 Paste up to *{MAX_UIDS_PER_BATCH}* UIDs.\nSeparator: space / comma / newline.", parse_mode="Markdown")
+    bot.register_next_step_handler(msg, process_uids)
 
-        target_uids = uids[:50]
-        total_count = len(target_uids)
+def process_uids(message):
+    chat_id = message.chat.id
+    uids = parse_uids(message.text)
+
+    if not uids:
+        bot.send_message(chat_id, "❌ No valid UIDs found.")
+        return
+
+    if len(uids) > MAX_UIDS_PER_BATCH:
+        bot.send_message(chat_id, f"⚠️ Truncating to first {MAX_UIDS_PER_BATCH} UIDs.")
+        uids = uids[:MAX_UIDS_PER_BATCH]
+
+    driver = get_driver()
+    total = len(uids)
+    results = []
+    debug_sent = False
+    start_time = time.time()
+
+    progress = bot.send_message(chat_id, f"🚀 Starting check on *{total}* UIDs...\n⏳ Initializing...", parse_mode="Markdown")
+
+    for idx, uid in enumerate(uids, start=1):
+        try:
+            driver.get(f"https://mbasic.facebook.com/{uid}")
+            time.sleep(PAGE_LOAD_DELAY)
+
+            if "login" in driver.current_url.lower() or not is_session_alive(driver):
+                results.append(f"{uid}, SESSION_DROPPED")
+                if not debug_sent:
+                    send_debug_screenshot(chat_id, "🚨 Session dropped mid-check.")
+                    debug_sent = True
+                break
+
+            # Execute the smart extraction function
+            count = extract_friend_count(driver)
+
+            if count is not None:
+                results.append(f"{uid}, {count}")
+            else:
+                results.append(f"{uid}, Hidden")
+                if not debug_sent:
+                    send_debug_screenshot(chat_id, f"🔍 First hidden/error UID: `{uid}`")
+                    debug_sent = True
+
+        except Exception:
+            results.append(f"{uid}, Error")
+
+        # ----- Live progress update -----
+        elapsed = time.time() - start_time
+        avg_per_uid = elapsed / idx
+        eta_sec = int(avg_per_uid * (total - idx))
+        eta_min, eta_s = divmod(eta_sec, 60)
+
+        recent = "\n".join(results[-15:])
+        try:
+            bot.edit_message_text(
+                f"📊 *Progress:* `{idx}/{total}`\n"
+                f"⏱ Elapsed: `{int(elapsed)}s` | ETA: `{eta_min}m {eta_s}s`\n\n"
+                f"📝 *Recent (CSV format):*\n```csv\n{recent}\n```",
+                chat_id, progress.message_id, parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+    # ----- Final summary & CSV Delivery -----
+    total_time = int(time.time() - start_time)
+    csv_content = "UID, Friends\n" + "\n".join(results)
+    
+    # Save as actual CSV file
+    fname = f"results_{chat_id}_{int(time.time())}.csv"
+    with open(fname, "w", encoding="utf-8") as f:
+        f.write(csv_content)
         
-        initial_text = f"⚙️ **Checking Started...**\n⏳ Progress: 0/{total_count} UIDs\n⏱️ Calculating time..."
-        status_msg = bot.send_message(chat_id, initial_text)
-        
-        driver = setup_driver(chat_id)
-        result_text = "📊 **Live Result:**\n\n"
-        last_edit_time = time.time()
-        
-        # স্ক্রিনশট মাত্র একবার পাঠানোর জন্য ফ্ল্যাগ সেট করা হলো
-        screenshot_sent = False 
-        
-        for index, uid in enumerate(target_uids):
-            url = f"https://www.facebook.com/profile.php?id={uid}" if uid.isdigit() else f"https://www.facebook.com/{uid}"
-                
-            driver.get(url)
-            time.sleep(random.uniform(3.0, 5.0)) # ফেসবুকের রেট লিমিট এড়াতে একটু সময় বাড়ানো হলো
+    final_text = (
+        f"✅ *Batch Complete!*\n"
+        f"🔢 Checked: `{len(results)}/{total}`\n"
+        f"⏱ Total time: `{total_time}s`\n"
+    )
+
+    try:
+        # Send the raw text summary
+        bot.edit_message_text(final_text, chat_id, progress.message_id, parse_mode="Markdown")
+        # Send the file
+        with open(fname, "rb") as f:
+            bot.send_document(chat_id, f, caption="📂 Here is your CSV file.")
+    except Exception:
+        bot.send_message(chat_id, final_text, parse_mode="Markdown")
+        with open(fname, "rb") as f:
+            bot.send_document(chat_id, f, caption="📂 Here is your CSV file.")
             
-            driver.execute_script("window.scrollBy(0, 400);")
-            
-            friend_text = "Hidden/Error"
-            
-            combined_xpath = "//a[contains(@href, 'friends') or contains(@href, 'sk=friends')] | //span[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'friends') or contains(text(), 'বন্ধুরা')] | //div[contains(@aria-label, 'Friends')]"
-            
+    # Cleanup
+    try:
+        os.remove(fname)
+    except OSError:
+        pass
+
+
+# ============================================================
+# 🏃 LAUNCH
+# ============================================================
+if __name__ == "__main__":
+    print("=" * 60)
+    print("FB Friend Checker Bot v8 — CSV + Resilient Edition")
+    print("=" * 60)
+    try:
+        # Reduced timeouts to prevent hanging dead connections
+        bot.infinity_polling(timeout=20, long_polling_timeout=20)
+    except KeyboardInterrupt:
+        if global_driver:
             try:
-                elements = driver.find_elements(By.XPATH, combined_xpath)
-                for el in elements:
-                    txt = el.text.strip()
-                    if txt and any(char.isdigit() for char in txt) and ("friend" in txt.lower() or "বন্ধু" in txt):
-                        friend_text = txt
-                        break
+                global_driver.quit()
             except Exception:
                 pass
-            
-            # Error পেলে শুধু প্রথমবার স্ক্রিনশট পাঠাবে
-            if friend_text == "Hidden/Error":
-                if not screenshot_sent:
-                    try:
-                        png_screenshot = driver.get_screenshot_as_png()
-                        image_bytes = BytesIO(png_screenshot)
-                        image_bytes.name = f"debug_{uid}.png"
-                        bot.send_photo(chat_id, image_bytes, caption=f"⚠️ Error view encountered for UID: {uid}\n(Showing screenshot only once to avoid spam)")
-                        screenshot_sent = True # ফ্ল্যাগ True করে দেওয়া হলো, যাতে আর ছবি না পাঠায়
-                    except Exception:
-                        pass 
-            
-            result_text += f"{uid} -> {friend_text}\n"
-            
-            current_count = index + 1
-            remaining_uids = total_count - current_count
-            eta_seconds = remaining_uids * 5.0 
-            
-            current_time = time.time()
-            if (current_time - last_edit_time > 3.0) or (current_count == total_count):
-                mins, secs = divmod(int(eta_seconds), 60)
-                live_status_text = f"⏳ **Live Progress:** {current_count}/{total_count} UIDs checked.\n⏱️ **ETA:** ~{mins} min {secs} sec remaining...\n\n{result_text}"
-                try:
-                    bot.edit_message_text(live_status_text, chat_id, status_msg.message_id)
-                    last_edit_time = current_time
-                except Exception:
-                    pass 
-                
-        final_text = f"✅ **Checking Completed!** ({total_count}/{total_count})\n\n{result_text}"
-        try:
-            bot.edit_message_text(final_text, chat_id, status_msg.message_id)
-        except:
-            bot.send_message(chat_id, final_text)
-        
-    except Exception as e:
-        bot.reply_to(message, f"❌ Error processing UIDs: {e}")
-    finally:
-        if driver:
-            driver.quit() 
-
-print("Bot is running securely with Live Progress Tracker...")
-bot.infinity_polling()
