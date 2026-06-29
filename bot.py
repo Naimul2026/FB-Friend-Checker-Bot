@@ -8,6 +8,7 @@ Target Site:  mbasic.facebook.com
 import os
 import re
 import time
+import threading
 import telebot
 from telebot import apihelper
 from telebot import types
@@ -20,7 +21,6 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
     TimeoutException,
-    NoSuchElementException,
     WebDriverException,
 )
 from webdriver_manager.chrome import ChromeDriverManager
@@ -28,7 +28,10 @@ from webdriver_manager.chrome import ChromeDriverManager
 # ============================================================
 # 🔐 CONFIG
 # ============================================================
-BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN_HERE"  # <-- Put your token here
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("❌ TELEGRAM_BOT_TOKEN environment variable not set. Please set it before running the bot.")
+
 MAX_UIDS_PER_BATCH = 50
 PAGE_LOAD_DELAY = 2          # seconds between UID checks
 WAIT_TIMEOUT = 8             # explicit-wait timeout
@@ -43,6 +46,7 @@ apihelper.RETRY_ON_ERROR = True
 # ============================================================
 global_driver = None
 user_credentials = {}        # {chat_id: {'email': ..., 'password': ...}}
+credentials_lock = threading.Lock()  # Prevent race conditions on concurrent logins
 
 # ============================================================
 # 🚀 DRIVER FACTORY (Persistent Browser)
@@ -104,7 +108,7 @@ def dismiss_interstitials(driver):
     interstitial_selectors = [
         "//a[contains(@href,'save-device') and (contains(translate(.,'NOT','not'),'not now') or contains(translate(.,'SKIP','skip'),'skip'))]",
         "//input[@value='Not Now' or @value='Not now']",
-        "//button[contains(translate(.,'ACEPT','acept'),'accept')]",
+        "//button[contains(translate(.,'ACCEPT','accept'),'accept')]",
         "//a[contains(translate(.,'SKIP','skip'),'skip')]",
     ]
     for xp in interstitial_selectors:
@@ -122,7 +126,7 @@ def send_debug_screenshot(chat_id, caption: str):
         global_driver.save_screenshot(fname)
         with open(fname, "rb") as photo:
             bot.send_photo(chat_id, photo, caption=caption, parse_mode="Markdown")
-    except Exception as e:
+    except Exception:
         pass
     finally:
         try:
@@ -153,7 +157,10 @@ def extract_friend_count(driver):
             target_words = ['friend', 'ami', 'amigo', 'বন্ধু']
             if any(target in txt for target in target_words):
                 # 3. Clean string (remove commas/dots like 1,000) and extract digits
-                clean_txt = txt.replace(',', '').replace('.', '')
+                clean_txt = txt.replace(',', '').replace('.', '').strip()
+                # Guard against empty strings after cleaning
+                if not clean_txt or clean_txt.isspace():
+                    continue
                 nums = re.findall(r'\d+', clean_txt)
                 if nums:
                     return nums[0] # Return just the number string
@@ -217,13 +224,15 @@ def cmd_login(message):
 
 def get_email(message):
     chat_id = message.chat.id
-    user_credentials[chat_id] = {"email": message.text.strip()}
+    with credentials_lock:
+        user_credentials[chat_id] = {"email": message.text.strip()}
     msg = bot.send_message(chat_id, "🔑 Now send the *password*:", parse_mode="Markdown")
     bot.register_next_step_handler(msg, get_password)
 
 def get_password(message):
     chat_id = message.chat.id
-    user_credentials[chat_id]["password"] = message.text.strip()
+    with credentials_lock:
+        user_credentials[chat_id]["password"] = message.text.strip()
     try:
         bot.delete_message(chat_id, message.message_id)
     except Exception:
@@ -258,6 +267,14 @@ def get_password(message):
                 current_url = driver.current_url
                 bot.edit_message_text(f"❌ *Login Failed.*\n📍 Stuck at: `{current_url}`\n📸 Sending screenshot...", chat_id, status.message_id, parse_mode="Markdown")
                 send_debug_screenshot(chat_id, "🔍 *Login failure capture.*")
+                # Reset browser on login failure
+                global global_driver
+                if global_driver:
+                    try:
+                        global_driver.quit()
+                    except Exception:
+                        pass
+                    global_driver = None
 
         except TimeoutException:
             if is_session_alive(driver):
@@ -267,6 +284,11 @@ def get_password(message):
 
     except Exception as e:
         bot.edit_message_text(f"❌ *Login process crashed.*\nError: `{e}`", chat_id, status.message_id, parse_mode="Markdown")
+    finally:
+        # Clear credentials after login attempt (security)
+        with credentials_lock:
+            if chat_id in user_credentials:
+                del user_credentials[chat_id]
 
 
 # ------------------------------------------------------------
@@ -334,7 +356,7 @@ def process_uids(message):
         eta_sec = int(avg_per_uid * (total - idx))
         eta_min, eta_s = divmod(eta_sec, 60)
 
-        recent = "\n".join(results[-15:])
+        recent = "\n".join(results[-15:]) if results else "⏳ Processing..."
         try:
             bot.edit_message_text(
                 f"📊 *Progress:* `{idx}/{total}`\n"
@@ -351,31 +373,33 @@ def process_uids(message):
     
     # Save as actual CSV file
     fname = f"results_{chat_id}_{int(time.time())}.csv"
-    with open(fname, "w", encoding="utf-8") as f:
-        f.write(csv_content)
-        
-    final_text = (
-        f"✅ *Batch Complete!*\n"
-        f"🔢 Checked: `{len(results)}/{total}`\n"
-        f"⏱ Total time: `{total_time}s`\n"
-    )
-
     try:
-        # Send the raw text summary
-        bot.edit_message_text(final_text, chat_id, progress.message_id, parse_mode="Markdown")
-        # Send the file
-        with open(fname, "rb") as f:
-            bot.send_document(chat_id, f, caption="📂 Here is your CSV file.")
-    except Exception:
-        bot.send_message(chat_id, final_text, parse_mode="Markdown")
-        with open(fname, "rb") as f:
-            bot.send_document(chat_id, f, caption="📂 Here is your CSV file.")
+        with open(fname, "w", encoding="utf-8") as f:
+            f.write(csv_content)
             
-    # Cleanup
-    try:
-        os.remove(fname)
-    except OSError:
-        pass
+        final_text = (
+            f"✅ *Batch Complete!*\n"
+            f"🔢 Checked: `{len(results)}/{total}`\n"
+            f"⏱ Total time: `{total_time}s`\n"
+        )
+
+        try:
+            # Send the raw text summary
+            bot.edit_message_text(final_text, chat_id, progress.message_id, parse_mode="Markdown")
+            # Send the file
+            with open(fname, "rb") as f:
+                bot.send_document(chat_id, f, caption="📂 Here is your CSV file.")
+        except Exception:
+            bot.send_message(chat_id, final_text, parse_mode="Markdown")
+            with open(fname, "rb") as f:
+                bot.send_document(chat_id, f, caption="📂 Here is your CSV file.")
+    finally:
+        # Cleanup
+        try:
+            if os.path.exists(fname):
+                os.remove(fname)
+        except OSError:
+            pass
 
 
 # ============================================================
